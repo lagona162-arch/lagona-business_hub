@@ -20,6 +20,7 @@ class _BhTopUpRequestScreenState extends State<BhTopUpRequestScreen> {
   String? _errorMessage;
   final _currencyFormat = NumberFormat.currency(symbol: '₱', decimalDigits: 2);
   final _dateFormat = DateFormat('MMM dd, yyyy HH:mm');
+  final _dateOnlyFormat = DateFormat('MMM dd, yyyy');
 
   @override
   void initState() {
@@ -268,18 +269,43 @@ class _BhTopUpRequestScreenState extends State<BhTopUpRequestScreen> {
                 const SizedBox(height: 24),
               ],
 
-              // Approved Requests
+              // Approved Requests (Grouped by Date)
               if (approvedRequests.isNotEmpty) ...[
-                const Text(
-                  'Approved Requests',
-                  style: TextStyle(
-                    fontSize: 20,
-                    fontWeight: FontWeight.bold,
+                Card(
+                  child: ExpansionTile(
+                    title: Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        const Text(
+                          'Approved Requests',
+                          style: TextStyle(
+                            fontSize: 18,
+                            fontWeight: FontWeight.bold,
+                          ),
+                        ),
+                        Container(
+                          padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
+                          decoration: BoxDecoration(
+                            color: Colors.green.shade100,
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                          child: Text(
+                            '${approvedRequests.length}',
+                            style: TextStyle(
+                              color: Colors.green.shade800,
+                              fontWeight: FontWeight.bold,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    initiallyExpanded: false,
+                    children: [
+                      ..._buildGroupedRequestsByDate(approvedRequests),
+                    ],
                   ),
                 ),
                 const SizedBox(height: 16),
-                ...approvedRequests.map((request) => _buildRequestCard(request)),
-                const SizedBox(height: 24),
               ],
 
               // Rejected Requests
@@ -337,6 +363,88 @@ class _BhTopUpRequestScreenState extends State<BhTopUpRequestScreen> {
         ),
       ),
     );
+  }
+
+  // Group approved requests by date
+  Map<String, List<BhTopUpRequest>> _groupRequestsByDate(List<BhTopUpRequest> requests) {
+    final Map<String, List<BhTopUpRequest>> grouped = {};
+    
+    for (final request in requests) {
+      if (request.approvedAt != null) {
+        final dateKey = _dateOnlyFormat.format(request.approvedAt!);
+        grouped.putIfAbsent(dateKey, () => []).add(request);
+      }
+    }
+    
+    // Sort requests within each date group by approvedAt (newest first)
+    grouped.forEach((key, value) {
+      value.sort((a, b) {
+        if (a.approvedAt == null || b.approvedAt == null) return 0;
+        return b.approvedAt!.compareTo(a.approvedAt!);
+      });
+    });
+    
+    return grouped;
+  }
+  
+  // Build grouped requests by date as ExpansionTiles
+  List<Widget> _buildGroupedRequestsByDate(List<BhTopUpRequest> requests) {
+    final grouped = _groupRequestsByDate(requests);
+    final sortedDates = grouped.keys.toList()..sort((a, b) {
+      // Sort dates in descending order (newest first)
+      try {
+        final dateA = _dateOnlyFormat.parse(a);
+        final dateB = _dateOnlyFormat.parse(b);
+        return dateB.compareTo(dateA);
+      } catch (e) {
+        return b.compareTo(a);
+      }
+    });
+    
+    return sortedDates.map((dateKey) {
+      final dateRequests = grouped[dateKey]!;
+      return Card(
+        margin: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+        child: ExpansionTile(
+          title: Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              Text(
+                dateKey,
+                style: const TextStyle(
+                  fontSize: 16,
+                  fontWeight: FontWeight.w600,
+                ),
+              ),
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+                decoration: BoxDecoration(
+                  color: Colors.blue.shade100,
+                  borderRadius: BorderRadius.circular(10),
+                ),
+                child: Text(
+                  '${dateRequests.length}',
+                  style: TextStyle(
+                    color: Colors.blue.shade800,
+                    fontWeight: FontWeight.bold,
+                    fontSize: 12,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          initiallyExpanded: false,
+          children: [
+            Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 8),
+              child: Column(
+                children: dateRequests.map((request) => _buildRequestCard(request)).toList(),
+              ),
+            ),
+          ],
+        ),
+      );
+    }).toList();
   }
 
   Widget _buildRequestCard(BhTopUpRequest request) {

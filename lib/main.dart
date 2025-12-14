@@ -130,6 +130,8 @@ class _AuthWrapperState extends State<AuthWrapper> {
     try {
       final isLoggedIn = await _authService.isLoggedIn();
       if (isLoggedIn) {
+        // getCurrentUser() will try to fetch fresh data from database first
+        // and fallback to cached data only if offline
         final user = await _authService.getCurrentUser();
         if (mounted) {
           setState(() {
@@ -145,10 +147,19 @@ class _AuthWrapperState extends State<AuthWrapper> {
         }
       }
     } catch (e) {
+      // Even if there's an error, try to get cached user for offline mode
       if (mounted) {
+        try {
+          final user = await _authService.getCurrentUser();
+          setState(() {
+            _user = user;
+            _isLoading = false;
+          });
+        } catch (_) {
         setState(() {
           _isLoading = false;
         });
+        }
       }
     }
   }

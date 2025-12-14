@@ -1,10 +1,8 @@
-import 'dart:convert';
 import 'package:shared_preferences/shared_preferences.dart';
 import '../models/business_hub.dart';
 import 'supabase_service.dart';
 
 class AuthService {
-  static const String _userKey = 'user_data';
   static const String _userIdKey = 'user_id';
   static const String _hasSeenBhCodeKey = 'has_seen_bhcode';
   final supabase = SupabaseService.client;
@@ -49,7 +47,7 @@ class AuthService {
   // Step 2: Get business hub data after BHCODE verification
   Future<BusinessHub> getBusinessHubAfterLogin(String userId) async {
     try {
-      // Get business hub data using the same id
+      // Get business hub data using the same id (always fetch fresh from database)
       final bhData = await supabase
           .from('business_hubs')
           .select()
@@ -63,10 +61,13 @@ class AuthService {
       final userData = Map<String, dynamic>.from(bhData);
       userData['id'] = userId;
       
-      // Save to local storage
+      // Only save userId for session management
+      try {
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setString(_userKey, jsonEncode(userData));
       await prefs.setString(_userIdKey, userId);
+      } catch (_) {
+        // Ignore errors saving userId - not critical
+      }
       
       return BusinessHub.fromJson(userData);
     } catch (e) {
@@ -103,13 +104,17 @@ class AuthService {
         throw Exception('Invalid BHCODE. Please enter the correct code.');
       }
 
-      // BHCODE is correct, save to local storage and return business hub data
+      // BHCODE is correct, return business hub data (always fetch fresh from database)
       final userData = Map<String, dynamic>.from(bhData);
       userData['id'] = userId;
       
+      // Only save userId for session management
+      try {
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setString(_userKey, jsonEncode(userData));
       await prefs.setString(_userIdKey, userId);
+      } catch (_) {
+        // Ignore errors saving userId - not critical
+      }
       
       return BusinessHub.fromJson(userData);
     } catch (e) {
@@ -134,7 +139,6 @@ class AuthService {
   Future<void> logout() async {
     final prefs = await SharedPreferences.getInstance();
     final userId = prefs.getString(_userIdKey);
-    await prefs.remove(_userKey);
     await prefs.remove(_userIdKey);
     if (userId != null) {
       await prefs.remove('$_hasSeenBhCodeKey$userId');
@@ -149,16 +153,25 @@ class AuthService {
 
   Future<BusinessHub?> getCurrentUser() async {
     try {
-      final prefs = await SharedPreferences.getInstance();
-      final userDataStr = prefs.getString(_userKey);
+      // Always fetch fresh data from database (real-time)
+      final userId = await getToken();
+      if (userId != null && userId.isNotEmpty) {
+        final bhData = await supabase
+            .from('business_hubs')
+            .select()
+            .eq('id', userId)
+            .maybeSingle();
       
-      if (userDataStr == null) {
-        return null;
+        if (bhData != null) {
+          final userData = Map<String, dynamic>.from(bhData);
+          userData['id'] = userId;
+      return BusinessHub.fromJson(userData);
+        }
       }
 
-      final userData = jsonDecode(userDataStr) as Map<String, dynamic>;
-      return BusinessHub.fromJson(userData);
+      return null;
     } catch (e) {
+      // Return null if error - no fallback to cached data
       return null;
     }
   }

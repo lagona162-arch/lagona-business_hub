@@ -6,10 +6,8 @@ import '../services/business_hub_service.dart';
 import '../theme/app_colors.dart';
 import 'login_screen.dart';
 import 'hierarchy_management_screen.dart';
-import 'topup_commission_screen.dart';
-import 'monitoring_screen.dart';
+import 'financial_management_screen.dart';
 import 'admin_control_screen.dart';
-import 'bh_topup_request_screen.dart';
 
 class DashboardScreen extends StatefulWidget {
   final BusinessHub user;
@@ -24,9 +22,47 @@ class _DashboardScreenState extends State<DashboardScreen> {
   final _authService = AuthService();
   final _businessHubService = BusinessHubService();
   final _currencyFormat = NumberFormat.currency(symbol: '₱', decimalDigits: 2);
+  double _bonusRate = 0.0;
+  bool _isLoadingRate = true;
+  double _balance = 0.0;
+  bool _isLoadingBalance = true;
+
+  @override
+  void initState() {
+    super.initState();
+    // Initialize with the balance from widget.user (fallback)
+    _balance = widget.user.balance;
+    _loadDashboardData();
+  }
 
   Future<void> _loadDashboardData() async {
-    setState(() {});
+    setState(() {
+      _isLoadingRate = true;
+      _isLoadingBalance = true;
+    });
+    
+    try {
+      // Load commission rate
+      final commissionRate = await _businessHubService.getBusinessHubCommissionRate();
+      
+      // Load fresh balance from database
+      final balanceData = await _businessHubService.getBalanceAndCashFlow();
+      final currentBalance = balanceData['current_balance'] ?? 0.0;
+      
+      setState(() {
+        _bonusRate = commissionRate;
+        _balance = currentBalance is double ? currentBalance : (double.tryParse(currentBalance.toString()) ?? 0.0);
+        _isLoadingRate = false;
+        _isLoadingBalance = false;
+      });
+    } catch (e) {
+      setState(() {
+        _bonusRate = 0.0;
+        // Keep current balance if loading fails
+        _isLoadingRate = false;
+        _isLoadingBalance = false;
+      });
+    }
   }
 
   Future<void> _logout() async {
@@ -107,7 +143,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
                             ),
                             const SizedBox(height: 4),
                             Text(
-                              _currencyFormat.format(widget.user.balance),
+                              _isLoadingBalance 
+                                ? '...' 
+                                : _currencyFormat.format(_balance),
                               style: const TextStyle(
                                 fontSize: 24,
                                 fontWeight: FontWeight.bold,
@@ -137,7 +175,9 @@ class _DashboardScreenState extends State<DashboardScreen> {
                             ),
                             const SizedBox(height: 4),
                             Text(
-                              '${(widget.user.bonusRate * 100).toStringAsFixed(1)}%',
+                              _isLoadingRate 
+                                ? '...' 
+                                : '${(_bonusRate * 100).toStringAsFixed(1)}%',
                               style: const TextStyle(
                                 fontSize: 24,
                                 fontWeight: FontWeight.bold,
@@ -180,49 +220,20 @@ class _DashboardScreenState extends State<DashboardScreen> {
               const SizedBox(height: 12),
               
               _FeatureCard(
-                title: 'Request Top-Up from Admin',
-                description: 'Request top-up to increase your balance',
-                icon: Icons.request_quote,
-                color: AppColors.primaryDark,
-                onTap: () {
-                  Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                      builder: (context) => BhTopUpRequestScreen(user: widget.user),
-                    ),
-                  );
-                },
-              ),
-              const SizedBox(height: 12),
-              
-              _FeatureCard(
-                title: 'Top-Up & Commission',
-                description: 'Approve top-up requests and view commissions',
+                title: 'Financial Management',
+                description: 'Request top-ups, approve requests, view commissions, and monitor transactions',
                 icon: Icons.account_balance_wallet,
                 color: AppColors.primary,
-                onTap: () {
-                  Navigator.push(
+                onTap: () async {
+                  // Navigate to Financial Management and refresh dashboard when returning
+                  await Navigator.push(
                     context,
                     MaterialPageRoute(
-                      builder: (context) => TopUpCommissionScreen(user: widget.user),
+                      builder: (context) => FinancialManagementScreen(user: widget.user),
                     ),
                   );
-                },
-              ),
-              const SizedBox(height: 12),
-              
-              _FeatureCard(
-                title: 'Monitoring & Oversight',
-                description: 'Monitor transactions and cash flow',
-                icon: Icons.analytics,
-                color: AppColors.primaryDark,
-                onTap: () {
-                  Navigator.push(
-                    context,
-                    MaterialPageRoute(
-                      builder: (context) => MonitoringScreen(user: widget.user),
-                    ),
-                  );
+                  // Refresh dashboard data when returning from Financial Management
+                  _loadDashboardData();
                 },
               ),
               const SizedBox(height: 12),

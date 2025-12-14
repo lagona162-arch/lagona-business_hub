@@ -9,6 +9,9 @@ class TopUpRequest {
   final DateTime requestedAt;
   final DateTime? approvedAt;
   final DateTime? rejectedAt;
+  final double? bonusRate; // Commission rate percentage
+  final double? bonusAmount; // Calculated bonus amount
+  final double? totalCredited; // Total credited (amount + bonus)
 
   TopUpRequest({
     required this.id,
@@ -21,6 +24,9 @@ class TopUpRequest {
     required this.requestedAt,
     this.approvedAt,
     this.rejectedAt,
+    this.bonusRate,
+    this.bonusAmount,
+    this.totalCredited,
   });
 
   factory TopUpRequest.fromJson(Map<String, dynamic> json) {
@@ -29,16 +35,19 @@ class TopUpRequest {
       loadingStationId: json['loading_station_id'] ?? '',
       loadingStationName: json['loading_station_name'] ?? '',
       loadingStationCode: json['loading_station_code'] ?? '',
-      amount: (json['amount'] ?? 0).toDouble(),
+      amount: (json['amount'] ?? json['requested_amount'] ?? 0).toDouble(),
       status: json['status'] ?? 'pending',
       rejectionReason: json['rejection_reason'],
-      requestedAt: DateTime.parse(json['requested_at'] ?? DateTime.now().toIso8601String()),
-      approvedAt: json['approved_at'] != null
-          ? DateTime.parse(json['approved_at'])
+      requestedAt: DateTime.parse(json['requested_at'] ?? json['created_at'] ?? DateTime.now().toIso8601String()),
+      approvedAt: json['approved_at'] != null || json['processed_at'] != null
+          ? DateTime.parse(json['approved_at'] ?? json['processed_at'])
           : null,
       rejectedAt: json['rejected_at'] != null
           ? DateTime.parse(json['rejected_at'])
           : null,
+      bonusRate: json['bonus_rate'] != null ? double.tryParse(json['bonus_rate'].toString()) : null,
+      bonusAmount: json['bonus_amount'] != null ? double.tryParse(json['bonus_amount'].toString()) : null,
+      totalCredited: json['total_credited'] != null ? double.tryParse(json['total_credited'].toString()) : null,
     );
   }
 
@@ -54,6 +63,9 @@ class TopUpRequest {
       'requested_at': requestedAt.toIso8601String(),
       'approved_at': approvedAt?.toIso8601String(),
       'rejected_at': rejectedAt?.toIso8601String(),
+      'bonus_rate': bonusRate,
+      'bonus_amount': bonusAmount,
+      'total_credited': totalCredited,
     };
   }
 }

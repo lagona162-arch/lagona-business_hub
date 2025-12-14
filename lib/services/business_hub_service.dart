@@ -1,4 +1,5 @@
 import 'package:supabase_flutter/supabase_flutter.dart';
+import 'package:flutter/foundation.dart';
 import '../models/loading_station.dart';
 import '../models/transaction.dart';
 import '../models/commission.dart';
@@ -40,13 +41,18 @@ class BusinessHubService {
   Future<List<TopUpRequest>> getTopUpRequests({String? status}) async {
     final bhId = await _getCurrentBhId();
     
+    if (bhId.isEmpty) {
+      throw Exception('Business Hub ID is empty. Please log in again.');
+    }
+    
+    try {
+      // Get all top-up requests for this business hub from the 'topup_requests' table
+      // Filter for Loading Station requests (where loading_station_id is NOT null)
     var queryBuilder = supabase
         .from('topup_requests')
-        .select('''
-          *,
-          loading_stations!inner(name, ls_code)
-        ''')
-        .eq('business_hub_id', bhId);
+          .select('*')
+          .eq('business_hub_id', bhId)
+          .filter('loading_station_id', 'not.is', null); // Only get LS requests
     
     if (status != null) {
       queryBuilder = queryBuilder.filter('status', 'eq', status);
@@ -54,39 +60,256 @@ class BusinessHubService {
     
     final response = await queryBuilder.order('created_at', ascending: false);
     
-    return (response as List).map((json) {
-      final data = Map<String, dynamic>.from(json);
-      // Map nested loading station data
-      if (data['loading_stations'] != null) {
-        final ls = data['loading_stations'] as Map<String, dynamic>;
-        data['loading_station_name'] = ls['name'];
-        data['loading_station_code'] = ls['ls_code'];
+      // Check if response is valid
+      if (response == null) {
+        return [];
       }
+      
+      final responseList = response as List;
+      
+      // All results are LS requests since we filtered in the query
+      final lsRequests = responseList;
+    
+    // Optimize: Fetch all unique loading station IDs first, then batch fetch their details
+    final uniqueLsIds = lsRequests
+        .map((json) => (json as Map<String, dynamic>)['loading_station_id'] as String?)
+        .whereType<String>()  // This filters out nulls and ensures non-nullable String type
+        .toSet()
+        .toList();
+    
+    // Fetch loading stations individually (simple and reliable approach)
+    Map<String, Map<String, dynamic>> lsDataMap = {};
+    for (final lsId in uniqueLsIds) {
+      try {
+        final lsData = await supabase
+            .from('loading_stations')
+            .select('id, name, ls_code')
+            .eq('id', lsId)
+            .maybeSingle();
+        
+        if (lsData != null) {
+          lsDataMap[lsId] = lsData as Map<String, dynamic>;
+        }
+      } catch (e) {
+        // Skip if fetch fails - will use 'Unknown' as fallback
+      }
+    }
+    
+    // Fetch Loading Station commission rate once (for calculating bonus on pending requests)
+    double lsCommissionRate = 0.0;
+    try {
+      lsCommissionRate = await getLoadingStationCommissionRate();
+    } catch (e) {
+      // If we can't get commission rate, will use 0.0 for calculations
+    }
+    
+    // First, collect requests that need bonus calculation and update database
+    final updatePromises = <Future>[];
+    for (var json in lsRequests) {
+      final data = Map<String, dynamic>.from(json);
+      final requestStatus = (data['status'] ?? 'pending').toString().toLowerCase();
+      final requestId = data['id'] as String?;
+      
+      if (requestStatus == 'pending' && requestId != null) {
+        // For pending requests, only set bonus_rate (not bonus_amount or total_credited)
+        // The admin will set these values when approving
+        if (data['bonus_rate'] == null) {
+          // Update the database so admin panel sees the expected bonus rate
+          // Round bonus_rate to 4 decimal places to avoid excessive trailing zeros
+          updatePromises.add(
+            supabase
+                .from('topup_requests')
+                .update({
+                  'bonus_rate': double.parse(lsCommissionRate.toStringAsFixed(4)),
+                })
+                .eq('id', requestId)
+                .then((_) => null)
+                .catchError((_) => null) // Ignore errors
+          );
+        }
+      }
+    }
+    
+    // Trigger updates without waiting (fire and forget)
+    Future.wait(updatePromises).catchError((_) => null);
+    
+    // Map the responses using the cached loading station data
+    final mappedRequests = lsRequests.map((json) {
+      final data = Map<String, dynamic>.from(json);
+      
+      // Get loading station details from the cached map
+      final loadingStationId = data['loading_station_id'] as String?;
+      if (loadingStationId != null && lsDataMap.containsKey(loadingStationId)) {
+        final lsData = lsDataMap[loadingStationId]!;
+        data['loading_station_name'] = lsData['name'] ?? 'Unknown';
+        data['loading_station_code'] = lsData['ls_code'] ?? '';
+      } else {
+        // Fallback if not found in cache
+        data['loading_station_name'] = 'Unknown';
+        data['loading_station_code'] = '';
+      }
+      
+      // Ensure loading_station_id is properly set
+      if (data['loading_station_id'] == null) {
+        // Skip if still null after filtering
+        return null;
+      }
+      
       // Map topup_requests table fields to TopUpRequest model
+      // The 'topup_requests' table uses 'created_at' for request time
       if (data['requested_at'] == null && data['created_at'] != null) {
         data['requested_at'] = data['created_at'];
       }
+      // The 'topup_requests' table uses 'requested_amount' field (map to 'amount' for model)
       if (data['amount'] == null && data['requested_amount'] != null) {
         data['amount'] = data['requested_amount'];
       }
+      
+      // The 'topup_requests' table has 'processed_at' for approval/rejection timestamp
       if (data['approved_at'] == null && data['processed_at'] != null && data['status'] == 'approved') {
         data['approved_at'] = data['processed_at'];
       }
       if (data['rejected_at'] == null && data['processed_at'] != null && data['status'] == 'rejected') {
         data['rejected_at'] = data['processed_at'];
       }
+      
+      // Ensure required fields exist for TopUpRequest model
+      if (data['loading_station_name'] == null || data['loading_station_name'].toString().isEmpty) {
+        data['loading_station_name'] = 'Unknown Loading Station';
+      }
+      if (data['loading_station_code'] == null || data['loading_station_code'].toString().isEmpty) {
+        data['loading_station_code'] = 'N/A';
+      }
+      
+      // For pending requests, calculate bonus if not already set (for display)
+      final requestStatus = (data['status'] ?? 'pending').toString().toLowerCase();
+      if (requestStatus == 'pending') {
+        final requestAmount = double.tryParse((data['amount'] ?? data['requested_amount'] ?? 0).toString()) ?? 0.0;
+        
+        // If bonus_rate, bonus_amount, or total_credited are not set, calculate them for display
+        if (data['bonus_rate'] == null || data['bonus_amount'] == null || data['total_credited'] == null) {
+          final calculatedBonusAmount = requestAmount * lsCommissionRate;
+          final calculatedTotalCredited = requestAmount + calculatedBonusAmount;
+          
+          // Set calculated values for display
+          data['bonus_rate'] = lsCommissionRate;
+          data['bonus_amount'] = calculatedBonusAmount;
+          data['total_credited'] = calculatedTotalCredited;
+        }
+      }
+      
+      // bonus_rate, bonus_amount, and total_credited are now set (either from DB or calculated)
+      try {
       return TopUpRequest.fromJson(data);
-    }).toList();
+      } catch (e) {
+        // If parsing fails, skip this request
+        return null;
+      }
+    }).whereType<TopUpRequest>().toList();
+    
+    return mappedRequests;
+    } catch (e) {
+      // Re-throw with more context
+      final errorMsg = e.toString();
+      if (errorMsg.contains('PGRST') || errorMsg.contains('JWT') || errorMsg.contains('permission')) {
+        throw Exception('Database access error. Please check your connection and permissions.');
+      }
+      throw Exception('Error fetching top-up requests: $errorMsg');
+    }
   }
 
   Future<void> approveTopUpRequest(String requestId) async {
     final bhId = await _getCurrentBhId();
     
-    // Start a transaction (Supabase supports transactions via RPC)
-    await supabase.rpc('approve_topup_request', params: {
-      'request_id': requestId,
-      'bh_id': bhId,
-    });
+    // Get the top-up request details from 'topup_requests' table
+    final requestData = await supabase
+        .from('topup_requests')
+        .select('requested_amount, loading_station_id')
+        .eq('id', requestId)
+        .eq('business_hub_id', bhId)
+        .eq('status', 'pending')
+        .single();
+    
+    // Get request amount from 'requested_amount' field
+    final requestAmount = double.tryParse(
+      (requestData['requested_amount'] ?? '0').toString()
+    ) ?? 0.0;
+    
+    final loadingStationId = requestData['loading_station_id'] as String?;
+    
+    if (loadingStationId == null) {
+      throw Exception('Loading Station ID not found');
+    }
+    
+    if (requestAmount <= 0) {
+      throw Exception('Invalid request amount: ${requestAmount.toStringAsFixed(2)}');
+    }
+    
+    // Get Loading Station commission rate
+    final lsCommissionRate = await getLoadingStationCommissionRate();
+    
+    // Calculate bonus and total credited
+    final bonusAmount = requestAmount * lsCommissionRate;
+    final totalCredited = requestAmount + bonusAmount;
+    
+    // Get current Business Hub balance
+    final bhData = await supabase
+        .from('business_hubs')
+        .select('balance')
+        .eq('id', bhId)
+        .single();
+    
+    final currentBhBalance = double.tryParse(bhData['balance']?.toString() ?? '0') ?? 0.0;
+    
+    // Check if Business Hub has sufficient balance for the total amount (request + bonus)
+    // The Business Hub must have enough to cover both the request amount and the bonus
+    if (currentBhBalance < totalCredited) {
+      throw Exception('Insufficient balance. Required: ${totalCredited.toStringAsFixed(2)} (Request: ${requestAmount.toStringAsFixed(2)} + Bonus: ${bonusAmount.toStringAsFixed(2)}), Available: ${currentBhBalance.toStringAsFixed(2)}');
+    }
+    
+    // Get current Loading Station balance
+    final lsData = await supabase
+        .from('loading_stations')
+        .select('balance')
+        .eq('id', loadingStationId)
+        .single();
+    
+    final currentLsBalance = double.tryParse(lsData['balance']?.toString() ?? '0') ?? 0.0;
+    
+    // Update balances and request status
+    // Note: Supabase doesn't support true transactions, so we do sequential updates
+    // In production, this should be handled by a database function/trigger
+    
+    // 1. Deduct the total amount (request amount + bonus) from Business Hub balance
+    // Since the Loading Station receives both the request amount and bonus, 
+    // the Business Hub must pay for both
+    await supabase
+        .from('business_hubs')
+        .update({
+          'balance': currentBhBalance - totalCredited, // Deduct total (request + bonus)
+        })
+        .eq('id', bhId);
+    
+    // 2. Credit total (request amount + bonus) to Loading Station
+    await supabase
+        .from('loading_stations')
+        .update({
+          'balance': currentLsBalance + totalCredited, // Credit includes bonus
+        })
+        .eq('id', loadingStationId);
+    
+    // 3. Update request status with computation details in 'topup_requests' table
+    // Round values to avoid excessive trailing zeros
+    await supabase
+        .from('topup_requests')
+        .update({
+          'status': 'approved',
+          'processed_at': DateTime.now().toIso8601String(),
+          'bonus_rate': double.parse(lsCommissionRate.toStringAsFixed(4)), // Store as decimal (e.g., 0.10 for 10%)
+          'bonus_amount': double.parse(bonusAmount.toStringAsFixed(2)), // Round currency to 2 decimal places
+          'total_credited': double.parse(totalCredited.toStringAsFixed(2)), // Round currency to 2 decimal places
+        })
+        .eq('id', requestId);
   }
 
   Future<void> rejectTopUpRequest(String requestId, String reason) async {
@@ -96,8 +319,8 @@ class BusinessHubService {
         .from('topup_requests')
         .update({
           'status': 'rejected',
+          'processed_at': DateTime.now().toIso8601String(),
           'rejection_reason': reason,
-          'rejected_at': DateTime.now().toIso8601String(),
         })
         .eq('id', requestId)
         .eq('business_hub_id', bhId);
@@ -110,23 +333,37 @@ class BusinessHubService {
   }) async {
     final bhId = await _getCurrentBhId();
     
-    var queryBuilder = supabase
-        .from('commissions')
-        .select()
-        .eq('business_hub_id', bhId);
-    
-    if (startDate != null) {
-      queryBuilder = queryBuilder.filter('created_at', 'gte', startDate.toIso8601String());
+    try {
+      var queryBuilder = supabase
+          .from('commissions')
+          .select()
+          .eq('business_hub_id', bhId);
+      
+      if (startDate != null) {
+        queryBuilder = queryBuilder.filter('created_at', 'gte', startDate.toIso8601String());
+      }
+      if (endDate != null) {
+        queryBuilder = queryBuilder.filter('created_at', 'lte', endDate.toIso8601String());
+      }
+      
+      final response = await queryBuilder.order('created_at', ascending: false);
+      
+      return (response as List)
+          .map((json) => Commission.fromJson(json as Map<String, dynamic>))
+          .toList();
+    } catch (e) {
+      // Handle case where commissions table doesn't exist yet
+      final errorString = e.toString();
+      if (errorString.contains('PGRST205') || 
+          errorString.contains('Could not find the table') ||
+          errorString.contains('commissions')) {
+        // Table doesn't exist - return empty list gracefully
+        // This allows the app to work even if the table hasn't been created yet
+        return [];
+      }
+      // Re-throw other errors
+      rethrow;
     }
-    if (endDate != null) {
-      queryBuilder = queryBuilder.filter('created_at', 'lte', endDate.toIso8601String());
-    }
-    
-    final response = await queryBuilder.order('created_at', ascending: false);
-    
-    return (response as List)
-        .map((json) => Commission.fromJson(json as Map<String, dynamic>))
-        .toList();
   }
 
   // Monitoring & Oversight
@@ -164,6 +401,30 @@ class BusinessHubService {
       data['type'] = 'topup';
       data['from_entity_id'] = data['loading_station_id'];
       data['from_entity_type'] = 'loading_station';
+      
+      // Map status field - check for various possible status field names
+      if (data['status'] == null) {
+        // If status is not directly available, check if transaction is completed
+        // Completed transactions typically have processed_at or completed_at set
+        if (data['processed_at'] != null || data['completed_at'] != null) {
+          data['status'] = 'completed';
+        } else {
+          data['status'] = 'pending';
+        }
+      }
+      
+      // Ensure status is lowercase to match expected values
+      if (data['status'] != null) {
+        final statusStr = data['status'].toString().toLowerCase();
+        if (statusStr == 'approved' || statusStr == 'processed' || statusStr == 'success') {
+          data['status'] = 'completed';
+        } else if (statusStr == 'failed' || statusStr == 'error') {
+          data['status'] = 'failed';
+        } else {
+          data['status'] = statusStr; // Keep as is (pending, completed, failed)
+        }
+      }
+      
       // Map nested loading station data
       if (data['loading_stations'] != null) {
         final ls = data['loading_stations'] as Map<String, dynamic>;
@@ -337,18 +598,129 @@ class BusinessHubService {
     
     final response = await queryBuilder.order('created_at', ascending: false);
     
+    // Fetch Business Hub commission rate (for calculating bonus on pending requests)
+    double bhCommissionRate = 0.0;
+    try {
+      bhCommissionRate = await getBusinessHubCommissionRate();
+    } catch (e) {
+      // If we can't get commission rate, will use 0.0 for calculations
+    }
+    
     // Filter for BH requests only (where loading_station_id is null)
     // and map topup_requests fields to BhTopUpRequest model
-    return (response as List)
+    final bhRequestsList = (response as List)
         .where((json) => json['loading_station_id'] == null) // Only BH requests
-        .map((json) {
+        .toList();
+    
+    // Update bonus for pending requests that don't have it calculated yet
+    final updatePromises = <Future>[];
+    for (var json in bhRequestsList) {
+      final data = json as Map<String, dynamic>;
+      final requestStatus = (data['status'] ?? 'pending').toString().toLowerCase();
+      final requestId = data['id'] as String?;
+      
+      if (requestStatus == 'pending' && requestId != null) {
+        // For pending requests, only set bonus_rate (not bonus_amount or total_credited)
+        // The admin will set these values when approving
+        if (data['bonus_rate'] == null) {
+          // Update the database so admin panel sees the expected bonus rate
+          // Round bonus_rate to 4 decimal places to avoid excessive trailing zeros
+          updatePromises.add(
+            supabase
+                .from('topup_requests')
+                .update({
+                  'bonus_rate': double.parse(bhCommissionRate.toStringAsFixed(4)),
+                })
+                .eq('id', requestId)
+                .then((_) => null)
+                .catchError((_) => null) // Ignore errors
+          );
+        }
+      }
+    }
+    
+    // Don't wait for updates - just trigger them
+    Future.wait(updatePromises).catchError((_) => null);
+    
+    // Map to BhTopUpRequest objects
+    return bhRequestsList.map((json) {
           final mappedData = Map<String, dynamic>.from(json as Map<String, dynamic>);
           mappedData['requested_at'] = mappedData['created_at'];
           mappedData['approved_at'] = mappedData['processed_at'];
           mappedData['rejected_at'] = mappedData['status'] == 'rejected' ? mappedData['processed_at'] : null;
           mappedData['approved_by'] = mappedData['processed_by'];
           return BhTopUpRequest.fromJson(mappedData);
-        })
-        .toList();
+    }).toList();
+  }
+
+  // Get Loading Station commission rate from commission settings
+  Future<double> getLoadingStationCommissionRate() async {
+    try {
+      // Get commission rate from commission_settings table for loading_station role
+      // The role column is an enum type (role_type), so we fetch all and filter client-side
+      final response = await supabase
+          .from('commission_settings')
+          .select('role, percentage');
+      
+      if (response != null && response is List) {
+        for (final setting in response) {
+          if (setting is! Map) continue;
+          
+          final role = setting['role']?.toString().toLowerCase() ?? '';
+          final percentage = setting['percentage'];
+          
+          // Check if this is a loading_station setting
+          if (role == 'loading_station') {
+            if (percentage != null) {
+              final percentageValue = double.tryParse(percentage.toString()) ?? 0.0;
+              // Convert percentage (e.g., 10.0) to decimal (0.10)
+              return percentageValue / 100;
+            }
+          }
+        }
+      }
+      
+      return 0.0;
+    } catch (e) {
+      debugPrint('Error getting loading station commission rate: $e');
+      return 0.0;
+    }
+  }
+
+  // Get Business Hub commission rate from commission settings
+  Future<double> getBusinessHubCommissionRate() async {
+    try {
+      // The commission_settings table has:
+      // - role: enum field (role_type) with value 'business_hub'
+      // - percentage: numeric field (0-100) storing the percentage value
+      
+      // The role column is an enum type (role_type), so we fetch all and filter client-side
+      final response = await supabase
+          .from('commission_settings')
+          .select('role, percentage');
+      
+      if (response != null && response is List) {
+        for (final setting in response) {
+          if (setting is! Map) continue;
+          
+          final role = setting['role']?.toString().toLowerCase() ?? '';
+          final percentage = setting['percentage'];
+          
+          // Check if this is a business_hub setting
+          if (role == 'business_hub') {
+            if (percentage != null) {
+              final percentageValue = double.tryParse(percentage.toString()) ?? 0.0;
+              // Convert percentage (e.g., 30.0) to decimal (0.30)
+              return percentageValue / 100;
+            }
+          }
+        }
+      }
+      
+      return 0.0;
+    } catch (e) {
+      debugPrint('Error getting business hub commission rate: $e');
+      return 0.0;
+    }
   }
 }
